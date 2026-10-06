@@ -1,0 +1,35 @@
+# Build output
+/build/
+build*/
+cmake-build-*/
+*.o
+*.a
+*.so
+telegrobsidian
+sync_daemon
+
+# Compile-time artefacts
+compile_commands.json
+.cache/
+.ccache/
+
+# Local configuration and secrets - never commit these
+.env
+.env.local
+*.env
+!.env.example
+
+# Runtime state and logs
+*.log
+state.json
+.telegrobsidian/
+
+# Python bytecode (the test and tooling scripts are Python)
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store

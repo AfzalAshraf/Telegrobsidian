@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-smoke-test:
+    name: Build (OpenSSL) and run the smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libssl-dev python3
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+                     -DTELEGROBSIDIAN_WITH_SSL=ON
+                     -DTELEGROBSIDIAN_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          if cmake --build build --parallel 2>&1 | tee build.log; then
+            exit 0
+          fi
+          # Log downloads are not reachable from every environment, so the first
+          # diagnostics are also published as check-run annotations.
+          echo "build failed, publishing diagnostics as annotations"
+          grep -E "error:|warning:" build.log | head -25 | while IFS= read -r line; do
+            printf '::error::%s\n' "$(printf '%s' "$line" | tr -d '\r' | sed 's/%/%25/g')"
+          done
+          exit 1
+
+      - name: Validate the scripts and the workflow file
+        run: |
+          bash -n scripts/install.sh scripts/register-telegram-webhook.sh
+          python3 -m py_compile scripts/smoke_test.py tests/mock_notion.py
+          python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/ci.yml'))" \
+            || echo "pyyaml not available, skipping the workflow lint"
+
+      - name: Version and build information
+        run: |
+          ./build/telegrobsidian --version
+          ldd ./build/telegrobsidian | grep -E 'ssl|crypto'
+
+      - name: End-to-end smoke test (mock Notion + Telegram, no credentials needed)
+        run: ctest --test-dir build --output-on-failure -R smoke
+
+      - name: Upload daemon log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-logs
+          path: /tmp/telegrobsidian-smoke-*/daemon.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-variants:
+    name: Build variant (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: clang + OpenSSL
+            cc: clang
+            cxx: clang++
+            cmake_flags: -DTELEGROBSIDIAN_WITH_SSL=ON
+          - name: gcc, no TLS backend
+            cc: gcc
+            cxx: g++
+            cmake_flags: -DTELEGROBSIDIAN_WITH_SSL=OFF
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libssl-dev clang
+
+      # The no-TLS variant is expected to warn about its runtime limitation.
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+                     -DTELEGROBSIDIAN_WARNINGS_AS_ERRORS=ON ${{ matrix.cmake_flags }}
+
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          if cmake --build build --parallel 2>&1 | tee build.log; then
+            exit 0
+          fi
+          echo "build failed, publishing diagnostics as annotations"
+          grep -E "error:|warning:" build.log | head -25 | while IFS= read -r line; do
+            printf '::error::%s\n' "$(printf '%s' "$line" | tr -d '\r' | sed 's/%/%25/g')"
+          done
+          exit 1
+
+      - name: Self-check (help, version, self-test without configuration)
+        run: |
+          ./build/telegrobsidian --help > /dev/null
+          ./build/telegrobsidian --version
+          # Without credentials the daemon must refuse to start rather than idle.
+          ./build/telegrobsidian --once && exit 1 || echo "--once without Notion credentials failed as expected"

@@ -1,0 +1,58 @@
+[Unit]
+Description=Telegrobsidian (Obsidian <-> Telegram <-> Notion sync daemon)
+Documentation=file:/usr/share/doc/telegrobsidian/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as the account that owns the vault. Create it first, e.g.:
+#   sudo useradd --system --home /var/lib/obsidian --create-home obsidian
+#   sudo -u obsidian mkdir -p /var/lib/obsidian/vault
+User=obsidian
+Group=obsidian
+WorkingDirectory=/var/lib/obsidian
+
+# All configuration and secrets live here; keep it readable by root only:
+#   sudo install -d -m 750 /etc/telegrobsidian
+#   sudo install -m 600 .env.example /etc/telegrobsidian/env
+EnvironmentFile=/etc/telegrobsidian/env
+
+ExecStart=/usr/local/bin/telegrobsidian
+# The daemon handles SIGTERM by draining the queue; give it room to finish.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=3
+# Do not restart in a tight loop when the configuration is wrong.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# --- hardening -------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+# The vault is the only place the daemon writes to.
+# Adjust the path if OBSIDIAN_VAULT_PATH points somewhere else.
+ReadWritePaths=/var/lib/obsidian
+
+# Useful for tuning: the daemon exposes counters on http://127.0.0.1:8080/healthz
+# (set WEBHOOK_BIND=127.0.0.1 if you front it with a reverse proxy).
+
+[Install]
+WantedBy=multi-user.target
