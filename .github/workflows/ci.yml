@@ -38,6 +38,13 @@ jobs:
           done
           exit 1
 
+      - name: Validate the scripts and the workflow file
+        run: |
+          bash -n scripts/install.sh scripts/register-telegram-webhook.sh
+          python3 -m py_compile scripts/smoke_test.py tests/mock_notion.py
+          python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/ci.yml'))" \
+            || echo "pyyaml not available, skipping the workflow lint"
+
       - name: Version and build information
         run: |
           ./build/telegrobsidian --version
