@@ -28,6 +28,7 @@ import json
 import os
 import shutil
 import signal
+import ssl
 import socket
 import subprocess
 import sys
@@ -43,6 +44,7 @@ DEFAULT_BINARY = ROOT / "build" / "telegrobsidian"
 PASS = "PASS"
 FAIL = "FAIL"
 results: list[tuple[str, bool, str]] = []
+skipped: list[tuple[str, str]] = []
 
 
 def check(name: str, condition: bool, detail: str = "") -> bool:
@@ -53,6 +55,33 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
         line += f"  <- {detail}"
     print(line, flush=True)
     return bool(condition)
+
+
+def skip(name: str, reason: str) -> None:
+    """Records a check that could not run in this environment.
+
+    Skips are reported separately from passes so a green run can never hide a
+    check that silently never executed.
+    """
+    skipped.append((name, reason))
+    print(f"[SKIP] {name}  ({reason})", flush=True)
+
+
+def start_mock(port: int, verbose: bool = False, tls_cert: Path | None = None,
+               tls_key: Path | None = None):
+    """Starts tests/mock_notion.py and waits for its LISTENING banner."""
+    cmd = [sys.executable, str(ROOT / "tests" / "mock_notion.py"), "--port", str(port)]
+    if verbose:
+        cmd.append("--verbose")
+    if tls_cert is not None:
+        cmd += ["--tls-cert", str(tls_cert), "--tls-key", str(tls_key)]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
+    assert proc.stdout is not None
+    banner = proc.stdout.readline().strip()
+    if not banner.startswith("LISTENING"):
+        proc.kill()
+        raise RuntimeError(f"mock server failed to start: {banner!r}")
+    return proc, int(banner.split()[1])
 
 
 def free_port() -> int:
@@ -155,17 +184,11 @@ def main() -> int:
 
     mock_port = free_port()
     webhook_port = free_port()
-    mock_cmd = [sys.executable, str(ROOT / "tests" / "mock_notion.py"), "--port", str(mock_port)]
-    if args.verbose_mock:
-        mock_cmd.append("--verbose")
-    mock = subprocess.Popen(mock_cmd, stdout=subprocess.PIPE, stderr=None, text=True)
-    assert mock.stdout is not None
-    banner = mock.stdout.readline().strip()
-    if not banner.startswith("LISTENING"):
-        print(f"mock server failed to start: {banner!r}", file=sys.stderr)
-        mock.kill()
+    try:
+        mock, mock_port = start_mock(mock_port, verbose=args.verbose_mock)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
-    mock_port = int(banner.split()[1])
     notion_base = f"http://127.0.0.1:{mock_port}"
     print(f"mock Notion listening on {notion_base}\n"
           f"daemon vault:   {vault}\n"
@@ -569,6 +592,81 @@ def main() -> int:
         check("no fatal errors in the log", "fatal:" not in log)
         check("no data race warnings", "unhandled error in" not in log)
 
+        # ------------------------------------------------------------------
+        # 16. TLS client: real handshake, certificate verification, opt-out
+        # ------------------------------------------------------------------
+        # Everything above talks plain HTTP to keep the suite runnable without
+        # OpenSSL. The checks below only run for a TLS-enabled binary and drive
+        # the OpenSSL code path against a self-signed HTTPS server, which is the
+        # only way to test certificate handling without touching the internet.
+        version = subprocess.run([str(binary), "--version"], capture_output=True, text=True,
+                                 timeout=30).stdout.strip()
+        if "tls: disabled" in version:
+            skip("TLS: handshake, verification, opt-out", f"built without OpenSSL ({version})")
+        elif shutil.which("openssl") is None:
+            skip("TLS: handshake, verification, opt-out", "openssl(1) not available to mint a test certificate")
+        else:
+            tls_dir = tmp / "tls"
+            tls_dir.mkdir(exist_ok=True)
+            cert, key = tls_dir / "cert.pem", tls_dir / "key.pem"
+            minted = subprocess.run(
+                ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+                 "-keyout", str(key), "-out", str(cert), "-days", "2",
+                 "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"],
+                capture_output=True, text=True, timeout=120)
+            if minted.returncode != 0:
+                skip("TLS: handshake, verification, opt-out",
+                     f"certificate generation failed: {minted.stderr[-200:]}")
+            else:
+                tls_env = dict(env)
+                tls_mock = None
+                try:
+                    tls_mock, tls_port = start_mock(free_port(), tls_cert=cert, tls_key=key)
+                    # Both clients (Notion and Telegram) go through the same TLS
+                    # configuration, so point both of them at the HTTPS mock.
+                    tls_env["NOTION_BASE_URL"] = f"https://127.0.0.1:{tls_port}"
+                    tls_env["TELEGRAM_API_BASE"] = f"https://127.0.0.1:{tls_port}"
+
+                    # (a) an untrusted certificate must abort the connection
+                    strict = subprocess.run([str(binary), "--self-test"], env=tls_env,
+                                            capture_output=True, text=True, timeout=120)
+                    strict_out = strict.stdout + strict.stderr
+                    check("a self-signed certificate is rejected by default",
+                          strict.returncode != 0,
+                          f"exit={strict.returncode}, output={strict_out[-300:]}")
+                    check("the certificate error is reported, not swallowed",
+                          any(word in strict_out.lower()
+                              for word in ("certificate", "ssl", "tls", "handshake")),
+                          strict_out[-300:])
+
+                    # (b) the opt-out must make the same endpoint work
+                    tls_env["NOTION_TLS_VERIFY"] = "false"
+                    permissive = subprocess.run([str(binary), "--self-test"], env=tls_env,
+                                                capture_output=True, text=True, timeout=120)
+                    permissive_out = permissive.stdout + permissive.stderr
+                    check("NOTION_TLS_VERIFY=false accepts the self-signed certificate",
+                          permissive.returncode == 0 and "Notion reachable" in permissive_out,
+                          f"exit={permissive.returncode}, output={permissive_out[-300:]}")
+
+                    # server-side proof that the request really crossed TLS
+                    context = ssl.create_default_context()
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    with urllib.request.urlopen(f"https://127.0.0.1:{tls_port}/_test/state",
+                                                context=context, timeout=10) as response:
+                        tls_state = json.loads(response.read().decode())
+                    check("the HTTPS server received the request after the opt-out",
+                          tls_state.get("getme_count", 0) > 0, str(tls_state)[:300])
+                except Exception as exc:  # noqa: BLE001 - reported as a failed check
+                    check("TLS scenario runs to completion", False, f"{type(exc).__name__}: {exc}")
+                finally:
+                    if tls_mock is not None:
+                        tls_mock.terminate()
+                        try:
+                            tls_mock.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            tls_mock.kill()
+
     finally:
         try:
             daemon.stop(signal.SIGKILL, timeout=5)
@@ -583,6 +681,10 @@ def main() -> int:
         failures = [name for name, ok, _ in results if not ok]
         print("\n" + "=" * 72)
         print(f"{len(results) - len(failures)}/{len(results)} checks passed")
+        if skipped:
+            print(f"{len(skipped)} check(s) skipped:")
+            for name, reason in skipped:
+                print(f"  - {name}: {reason}")
         if failures:
             print("failed checks:")
             for name in failures:

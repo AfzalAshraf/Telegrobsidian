@@ -706,6 +706,8 @@ void print_help(const char* argv0) {
 struct Config {
     // Vault
     fs::path vault_path{"/var/lib/obsidian/vault"};
+
+
     fs::path state_file;
     std::string notion_mirror_dir{"notion_sync"};
     std::string telegram_inbox_dir{"telegram_inbox"};
@@ -746,6 +748,11 @@ struct Config {
     // of creating one Notion page per note; opt in with this flag.
     bool push_existing_on_startup{false};
     bool use_system_ca_bundle{true};
+    // TLS trust: a private CA bundle for corporate proxies/self-signed setups,
+    // and an explicit, loudly logged opt-out for the rare case where a device
+    // or appliance cannot be given a trusted certificate.
+    std::string ca_cert_path;
+    bool tls_verify{true};
     int max_push_attempts{3};
 
     // Logging
@@ -817,6 +824,8 @@ struct Config {
             env_bool("PUSH_EXISTING_ON_STARTUP", c.push_existing_on_startup, c.warnings);
         c.use_system_ca_bundle =
             env_bool("USE_SYSTEM_CA_BUNDLE", c.use_system_ca_bundle, c.warnings);
+        c.ca_cert_path = env_string("NOTION_CA_CERT_PATH", c.ca_cert_path);
+        c.tls_verify = env_bool("NOTION_TLS_VERIFY", c.tls_verify, c.warnings);
         c.max_push_attempts =
             static_cast<int>(env_int("MAX_PUSH_ATTEMPTS", c.max_push_attempts, c.warnings, 1, 10));
 
@@ -834,6 +843,8 @@ struct Config {
         c.log_json = env_bool("LOG_JSON", c.log_json, c.warnings);
         return c;
     }
+
+
 
     // Warnings that indicate a likely copy/paste of the placeholder docs.
     std::vector<std::string> validate() const {
@@ -890,6 +901,29 @@ struct Config {
         return problems;
     }
 };
+
+// Applies the TLS trust configuration to every HTTPS client (Notion and
+// Telegram). Kept in one place so a new call site cannot silently skip the
+// certificate checks.
+inline void configure_tls(httplib::Client& client, const Config& cfg) {
+#if TELEGROBSIDIAN_HAS_SSL
+    if (!cfg.ca_cert_path.empty()) {
+        client.set_ca_cert_path(cfg.ca_cert_path);
+        Logger::debug(fmt("using the CA bundle from NOTION_CA_CERT_PATH: %s", cfg.ca_cert_path));
+    }
+    client.enable_server_certificate_verification(cfg.tls_verify);
+    if (!cfg.tls_verify) {
+        static std::once_flag warned;
+        std::call_once(warned, [] {
+            Logger::warn("NOTION_TLS_VERIFY=false: server certificate verification is DISABLED; "
+                         "traffic can be intercepted. Prefer NOTION_CA_CERT_PATH.");
+        });
+    }
+#else
+    (void)client;
+    (void)cfg;
+#endif
+}
 
 // =============================================================================
 //  Persistent state (Notion cursor, mirror bookkeeping, push fingerprints)
@@ -2083,9 +2117,7 @@ private:
             client.set_connection_timeout(cfg_.http_connect_timeout);
             client.set_read_timeout(cfg_.http_read_timeout);
             client.set_write_timeout(cfg_.http_read_timeout);
-#if TELEGROBSIDIAN_HAS_SSL
-            client.enable_server_certificate_verification(true);
-#endif
+            configure_tls(client, cfg_);
 
             const httplib::Headers headers = {
                 {"Authorization", "Bearer " + cfg_.notion_api_key},
@@ -3259,9 +3291,7 @@ private:
                 httplib::Client client(cfg_.telegram_api_base);
                 client.set_connection_timeout(cfg_.http_connect_timeout);
                 client.set_read_timeout(cfg_.http_read_timeout);
-#if TELEGROBSIDIAN_HAS_SSL
-                client.enable_server_certificate_verification(true);
-#endif
+                configure_tls(client, cfg_);
 
                 httplib::Params params{{"url", url}};
                 if (!cfg_.telegram_webhook_secret.empty()) {
@@ -3343,9 +3373,7 @@ private:
                 } else {
                 httplib::Client client(cfg_.telegram_api_base);
                 client.set_connection_timeout(cfg_.http_connect_timeout);
-#if TELEGROBSIDIAN_HAS_SSL
-                client.enable_server_certificate_verification(true);
-#endif
+                configure_tls(client, cfg_);
                 const auto res = client.Get(("/bot" + cfg_.telegram_bot_token + "/getMe").c_str());
                 if (res && res->status == 200) {
                     const json me = json::parse(res->body, nullptr, false);

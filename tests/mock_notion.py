@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import ssl
 import sys
 import threading
 import time
@@ -358,11 +359,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--tls-cert", help="serve HTTPS with this certificate (PEM)")
+    parser.add_argument("--tls-key", help="private key belonging to --tls-cert")
     args = parser.parse_args()
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.daemon_threads = True
     server.verbose = args.verbose  # type: ignore[attr-defined]
+    if args.tls_cert:
+        # Used by the smoke test to prove that the daemon's TLS client code
+        # performs a real handshake and rejects untrusted certificates.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(args.tls_cert, args.tls_key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     print(f"LISTENING {server.server_address[1]}", flush=True)
     try:
         server.serve_forever(poll_interval=0.1)

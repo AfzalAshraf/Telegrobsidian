@@ -129,6 +129,9 @@ Useful knobs:
 | `DEDUP_COOLDOWN_MS` | `5000` | Lifetime of the "we wrote this file" markers. |
 | `WATCHER_RESCAN_SEC` | `120` | Re-scan interval for new directories. |
 | `MAX_PUSH_ATTEMPTS` | `3` | Attempts for `429`/`5xx` answers. |
+| `NOTION_CA_CERT_PATH` | *(empty)* | Extra PEM bundle to trust (private CA / TLS-inspection proxy). |
+| `NOTION_TLS_VERIFY` | `true` | Certificate verification. Turning it off logs a warning; prefer `NOTION_CA_CERT_PATH`. |
+| `USE_SYSTEM_CA_BUNDLE` | `true` | Point `SSL_CERT_FILE` at the system bundle when unset. |
 | `PUSH_EXISTING_ON_STARTUP` | `false` | Upload files that already exist on a first run. |
 | `LOG_LEVEL` | `info` | `trace`, `debug`, `info`, `warn`, `error`. |
 
@@ -335,8 +338,16 @@ answers), runs the real daemon against it over loopback HTTP and asserts:
 * webhook hardening (secret check, empty body, non-text updates);
 * `--self-test`, `/healthz`, the state file and a clean `SIGTERM` shutdown.
 
+For a TLS-enabled binary the suite adds a `TLS:` scenario: it mints a
+self-signed certificate, serves the mock over HTTPS and asserts that the daemon
+*rejects* the untrusted certificate, reports the failure instead of swallowing
+it, and accepts the same endpoint once `NOTION_TLS_VERIFY=false` is set. That is
+the only way to exercise the OpenSSL client without contacting the internet, and
+it is skipped (and reported as skipped) for a binary built without TLS.
+
 CI (`.github/workflows/ci.yml`) builds with `-Werror` for GCC and Clang, runs
-the smoke test on the OpenSSL build and compiles the no-TLS variant.
+the smoke test – TLS scenario included – on the OpenSSL build, and compiles the
+no-TLS variant so the plain-HTTP path cannot rot.
 
 ## Troubleshooting
 
