@@ -24,7 +24,19 @@ jobs:
                      -DTELEGROBSIDIAN_WARNINGS_AS_ERRORS=ON
 
       - name: Build
-        run: cmake --build build --parallel
+        shell: bash
+        run: |
+          set -o pipefail
+          if cmake --build build --parallel 2>&1 | tee build.log; then
+            exit 0
+          fi
+          # Log downloads are not reachable from every environment, so the first
+          # diagnostics are also published as check-run annotations.
+          echo "build failed, publishing diagnostics as annotations"
+          grep -E "error:|warning:" build.log | head -25 | while IFS= read -r line; do
+            printf '::error::%s\n' "$(printf '%s' "$line" | tr -d '\r' | sed 's/%/%25/g')"
+          done
+          exit 1
 
       - name: Version and build information
         run: |
@@ -75,7 +87,17 @@ jobs:
                      -DTELEGROBSIDIAN_WARNINGS_AS_ERRORS=ON ${{ matrix.cmake_flags }}
 
       - name: Build
-        run: cmake --build build --parallel
+        shell: bash
+        run: |
+          set -o pipefail
+          if cmake --build build --parallel 2>&1 | tee build.log; then
+            exit 0
+          fi
+          echo "build failed, publishing diagnostics as annotations"
+          grep -E "error:|warning:" build.log | head -25 | while IFS= read -r line; do
+            printf '::error::%s\n' "$(printf '%s' "$line" | tr -d '\r' | sed 's/%/%25/g')"
+          done
+          exit 1
 
       - name: Self-check (help, version, self-test without configuration)
         run: |

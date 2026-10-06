@@ -25,7 +25,9 @@ find_package(Threads REQUIRED)
 # httplib.h and nlohmann/json.hpp are vendored under include/ so the build works
 # on a machine without network access (see scripts/install-deps.sh).
 add_library(telegrobsidian_deps INTERFACE)
-target_include_directories(telegrobsidian_deps INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+# SYSTEM: warnings coming from the vendored headers are not actionable here and
+# would otherwise fail the -Werror builds as soon as a compiler adds a warning.
+target_include_directories(telegrobsidian_deps SYSTEM INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(telegrobsidian_deps INTERFACE Threads::Threads)
 
 if(TELEGROBSIDIAN_WITH_SSL)

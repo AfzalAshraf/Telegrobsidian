@@ -1687,7 +1687,7 @@ struct ApiResult {
 
 class NotionClient {
 public:
-    NotionClient(const Config& cfg, Stats& stats) : cfg_(cfg), stats_(stats) {}
+    explicit NotionClient(const Config& cfg) : cfg_(cfg) {}
 
     bool enabled() const { return enabled_; }
 
@@ -1926,7 +1926,6 @@ private:
     }
 
     const Config& cfg_;
-    Stats& stats_;
     bool enabled_ = true;
     std::mutex title_mtx_;
     std::string title_property_;
@@ -1939,7 +1938,7 @@ std::string render_rich_text(const json& rich_text) {
     if (!rich_text.is_array()) return {};
     std::string out;
     for (const auto& part : rich_text) {
-        const json& text = part.contains("text") ? part["text"] : json::object();
+        const json text = part.contains("text") ? part["text"] : json::object();
         std::string content;
         if (text.contains("content") && text["content"].is_string()) {
             content = text["content"].get<std::string>();
@@ -1948,7 +1947,7 @@ std::string render_rich_text(const json& rich_text) {
         }
         if (content.empty() && json_string(part, "type") != "mention") continue;
 
-        const json& ann = part.contains("annotations") ? part["annotations"] : json::object();
+        const json ann = part.contains("annotations") ? part["annotations"] : json::object();
         const bool bold = json_bool(ann, "bold");
         const bool italic = json_bool(ann, "italic");
         const bool code = json_bool(ann, "code");
@@ -2184,7 +2183,7 @@ public:
           writer_(cfg_, suppression_),
           watcher_(cfg_, queue_, suppression_, tracker_, stats_),
           state_(cfg_.state_file, cfg_.notion_page_cache_max),
-          notion_(cfg_, stats_) {}
+          notion_(cfg_) {}
 
     int run() {
         install_signal_handlers();
