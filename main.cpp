@@ -49,6 +49,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <mutex>
@@ -103,28 +104,237 @@ constexpr size_t kNotionTitlePropertyProbe = 1;
 // =============================================================================
 //  Small utilities
 // =============================================================================
-inline const char* fmt_arg(const std::string& s) { return s.c_str(); }
+// -----------------------------------------------------------------------------
+//  printf-style formatting without std::format
+// -----------------------------------------------------------------------------
+// libstdc++ only ships <format> from GCC 13 onward, so the daemon carries this
+// small formatter instead of linking another dependency. It also avoids passing
+// a runtime format string to printf-family functions, which newer compilers
+// reject as a potential format-string vulnerability (-Wformat-security /
+// -Wformat-nonliteral) and which would be a real hazard if any caller ever
+// forwarded user input as the pattern.
+//
+// Supported (the subset this project uses): %s %d %i %u %x %X %c %f %g %% with
+// the flags '-' and '0', an optional width, an optional precision and the
+// length modifiers l/ll/z/h.
+struct FormatArg {
+    std::string text;                // default rendering
+    unsigned long long integer = 0;  // valid when integral
+    double real = 0.0;               // valid when floating
+    bool integral = false;
+    bool floating = false;
+};
+
+inline FormatArg make_arg(const std::string& value) { return FormatArg{value}; }
+inline FormatArg make_arg(std::string_view value) { return FormatArg{std::string(value)}; }
+inline FormatArg make_arg(const char* value) {
+    return FormatArg{value != nullptr ? std::string(value) : std::string("(null)")};
+}
+inline FormatArg make_arg(const fs::path& value) { return FormatArg{value.string()}; }
 
 template <typename T, std::enable_if_t<std::is_arithmetic_v<T>, int> = 0>
-T fmt_arg(T v) {
-    return v;
+FormatArg make_arg(T value) {
+    FormatArg arg;
+    if constexpr (std::is_same_v<T, bool>) {
+        arg.text = value ? "true" : "false";
+        arg.integer = value ? 1ULL : 0ULL;
+        arg.integral = true;
+    } else if constexpr (std::is_floating_point_v<T>) {
+        std::ostringstream os;
+        os << value;
+        arg.text = os.str();
+        arg.real = static_cast<double>(value);
+        arg.floating = true;
+    } else {
+        arg.integer = static_cast<unsigned long long>(value);
+        arg.text = std::to_string(value);
+        arg.integral = true;
+    }
+    return arg;
 }
 
-template <typename T, std::enable_if_t<!std::is_arithmetic_v<T>, int> = 0>
-const T& fmt_arg(const T& v) {
-    return v;
+inline std::string to_hex(unsigned long long value) {
+    if (value == 0) return "0";
+    static const char* digits = "0123456789abcdef";
+    std::string out;
+    while (value > 0) {
+        out.insert(out.begin(), digits[value & 0xF]);
+        value >>= 4;
+    }
+    return out;
 }
 
-// printf-style formatting without std::format (libstdc++ gained <format> only
-// in GCC 13). Requires a literal format string; std::string arguments map onto
-// %s automatically.
+inline std::string format_impl(std::string_view pattern, const std::vector<FormatArg>& args) {
+    std::string out;
+    out.reserve(pattern.size() + 32);
+    size_t next_arg = 0;
+
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if (pattern[i] != '%') {
+            out += pattern[i];
+            continue;
+        }
+        if (i + 1 >= pattern.size()) {
+            out += '%';
+            break;
+        }
+        if (pattern[i + 1] == '%') {
+            out += '%';
+            ++i;
+            continue;
+        }
+
+        size_t j = i + 1;
+        bool left_aligned = false;
+        bool zero_padded = false;
+        for (; j < pattern.size(); ++j) {
+            const char flag = pattern[j];
+            if (flag == '-') {
+                left_aligned = true;
+            } else if (flag == '0') {
+                zero_padded = true;
+            } else if (flag == '+' || flag == ' ' || flag == '#') {
+                // accepted and ignored
+            } else {
+                break;
+            }
+        }
+        size_t width = 0;
+        bool has_width = false;
+        for (; j < pattern.size() && std::isdigit(static_cast<unsigned char>(pattern[j])); ++j) {
+            has_width = true;
+            width = width * 10 + static_cast<size_t>(pattern[j] - '0');
+        }
+        size_t precision = 0;
+        bool has_precision = false;
+        if (j < pattern.size() && pattern[j] == '.') {
+            ++j;
+            while (j < pattern.size() && std::isdigit(static_cast<unsigned char>(pattern[j]))) {
+                has_precision = true;
+                precision = precision * 10 + static_cast<size_t>(pattern[j] - '0');
+                ++j;
+            }
+        }
+        while (j < pattern.size() && (pattern[j] == 'l' || pattern[j] == 'z' || pattern[j] == 'h' ||
+                                      pattern[j] == 'q' || pattern[j] == 'j' || pattern[j] == 't')) {
+            ++j;
+        }
+        if (j >= pattern.size()) {  // truncated conversion: copy verbatim
+            out += pattern.substr(i);
+            break;
+        }
+
+        const char conversion = pattern[j];
+        const bool known = conversion == 's' || conversion == 'd' || conversion == 'i' ||
+                           conversion == 'u' || conversion == 'x' || conversion == 'X' ||
+                           conversion == 'c' || conversion == 'f' || conversion == 'g';
+        if (!known) {
+            out += pattern.substr(i, j - i + 1);
+            i = j;
+            continue;
+        }
+
+        // A missing argument is a programming error: render it visibly instead
+        // of reading out of bounds.
+        const FormatArg arg = next_arg < args.size()
+                                  ? args[next_arg++]
+                                  : FormatArg{"<missing>" + std::string(1, conversion)};
+
+        std::string value;
+        if (conversion == 'f' && arg.floating) {
+            std::ostringstream os;
+            os << std::fixed << std::setprecision(has_precision ? static_cast<int>(precision) : 6)
+               << arg.real;
+            value = os.str();
+        } else if ((conversion == 'x' || conversion == 'X') && arg.integral) {
+            value = to_hex(arg.integer);
+            if (conversion == 'X') {
+                for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            }
+        } else {
+            value = arg.text;
+        }
+
+        if (has_precision && value.size() < precision) {
+            value.insert(0, precision - value.size(), '0');
+        }
+        if (has_width && value.size() < width) {
+            const size_t padding = width - value.size();
+            const bool numeric_zero_pad = zero_padded && !left_aligned;
+            if (left_aligned) {
+                value.append(padding, ' ');
+            } else {
+                value.insert(0, padding, numeric_zero_pad ? '0' : ' ');
+            }
+        }
+
+        out += value;
+        i = j;
+    }
+    return out;
+}
+
+// All call sites pass a string literal as the pattern; the signature accepts a
+// string_view so the literal is not copied.
 template <typename... Args>
-std::string fmt(const char* f, const Args&... args) {
-    const int needed = std::snprintf(nullptr, 0, f, fmt_arg(args)...);
-    if (needed <= 0) return {};
-    std::vector<char> buf(static_cast<size_t>(needed) + 1);
-    std::snprintf(buf.data(), buf.size(), f, fmt_arg(args)...);
-    return std::string(buf.data(), static_cast<size_t>(needed));
+std::string fmt(std::string_view pattern, const Args&... args) {
+    const std::vector<FormatArg> collected{make_arg(args)...};
+    return format_impl(pattern, collected);
+}
+
+// Verifies the formatter against the conversions this project relies on. Run by
+// --self-test; it exists because a hand-written formatter deserves its own
+// checks rather than only being exercised by the integration test.
+inline bool check_formatter(std::string& report) {
+    struct Case {
+        const char* name;
+        std::string got;
+        std::string want;
+    };
+    const std::vector<Case> cases = {
+        {"literal", fmt("hello world"), "hello world"},
+        {"percent", fmt("100%% sure"), "100% sure"},
+        {"string", fmt("a=%s", std::string("b")), "a=b"},
+        {"c-string", fmt("%s/%s", "x", "yy"), "x/yy"},
+        {"path", fmt("%s", fs::path("/tmp/vault")), "/tmp/vault"},
+        {"string-view", fmt("%s", std::string_view("view")), "view"},
+        {"bool", fmt("%s", true), "true"},
+        {"int", fmt("%d", 42), "42"},
+        {"negative", fmt("%lld", static_cast<long long>(-12)), "-12"},
+        {"unsigned", fmt("%llu", static_cast<unsigned long long>(18446744073709551615ULL)),
+         "18446744073709551615"},
+        {"size-t", fmt("%zu", static_cast<size_t>(17)), "17"},
+        {"two-digit", fmt("%02d:%02d:%02d", 9, 5, 3), "09:05:03"},
+        {"three-digit-with-suffix", fmt("%03dZ", 5), "005Z"},
+        {"four-digit", fmt("%04d-%02d", 2026, 6), "2026-06"},
+        {"left-aligned", fmt("[%-5s]", std::string("ab")), "[ab   ]"},
+        {"right-aligned", fmt("[%5s]", std::string("ab")), "[   ab]"},
+        {"hex", fmt("%x", 255), "ff"},
+        {"hex-padded", fmt("%04x", 15), "000f"},
+        {"hex-upper", fmt("%X", 255), "FF"},
+        {"hex-64", fmt("%016llx", static_cast<unsigned long long>(0xabc)), "0000000000000abc"},
+        {"json-escape", fmt("\\u%04x", 31), "\\u001f"},
+        {"float", fmt("%f", 1.5), "1.500000"},
+        {"precision", fmt("%.3d", 7), "007"},
+        {"adjacent", fmt("%s%s", "a", "b"), "ab"},
+        {"no-args-mixed", fmt("no arguments here"), "no arguments here"},
+        {"too-few-args", fmt("%s and %s", "only-one"), "only-one and <missing>s"},
+    };
+
+    std::ostringstream failures;
+    size_t failed = 0;
+    for (const Case& item : cases) {
+        if (item.got != item.want) {
+            ++failed;
+            failures << "\n  " << item.name << ": got '" << item.got << "', want '" << item.want << "'";
+        }
+    }
+    if (failed == 0) {
+        report = fmt("%zu formatter checks passed", cases.size());
+        return true;
+    }
+    report = fmt("%zu/%zu formatter checks FAILED", failed, cases.size()) + failures.str();
+    return false;
 }
 
 std::string to_lower(std::string s) {
@@ -3077,6 +3287,12 @@ private:
     int self_test() {
         bool ok = true;
         Logger::info("self-test: validating configuration and credentials");
+
+        std::string formatter_report;
+        const bool formatter_ok = check_formatter(formatter_report);
+        ok = ok && formatter_ok;
+        Logger::log(formatter_ok ? LogLevel::Success : LogLevel::Error,
+                    (formatter_ok ? "internal: " : "internal: ") + formatter_report);
 
         if (notion_.enabled()) {
             const ApiResult res = notion_.database_info();
