@@ -48,7 +48,17 @@ target_link_libraries(telegrobsidian PRIVATE telegrobsidian_deps)
 target_compile_options(telegrobsidian PRIVATE -Wall -Wextra -Wpedantic -Wshadow)
 
 if(TELEGROBSIDIAN_WARNINGS_AS_ERRORS)
-    target_compile_options(telegrobsidian PRIVATE -Werror)
+    # -Werror alone is not enough: compilers disagree about which diagnostics
+    # -Wall implies (Clang enables -Wunused-const-variable for C++, GCC does
+    # not), so the stricter build opts into the extra checks explicitly.
+    include(CheckCXXCompilerFlag)
+    foreach(extra_flag -Werror -Wunused-const-variable -Wunused-but-set-variable)
+        string(MAKE_C_IDENTIFIER "TELEGROBSIDIAN_FLAG${extra_flag}" flag_variable)
+        check_cxx_compiler_flag("${extra_flag}" ${flag_variable})
+        if(${flag_variable})
+            target_compile_options(telegrobsidian PRIVATE "${extra_flag}")
+        endif()
+    endforeach()
 endif()
 
 include(GNUInstallDirs)

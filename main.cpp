@@ -99,7 +99,6 @@ constexpr size_t kInotifyBufferSize = 64 * 1024;  // >= sizeof(inotify_event)+NA
 constexpr size_t kMaxCaptureChildren = 100;       // Notion: max blocks per request
 constexpr size_t kMaxRichTextChunk = 1900;        // Notion: max rich text length
 constexpr int kMaxPageFailures = 3;               // give up mirroring a page after N polls
-constexpr size_t kNotionTitlePropertyProbe = 1;
 
 // =============================================================================
 //  Small utilities
