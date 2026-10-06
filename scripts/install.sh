@@ -181,5 +181,5 @@ $(printf '\033[1mNext steps\033[0m')
       sudo systemctl start obsidian-sync && journalctl -u obsidian-sync -f
     or in the foreground:  $PREFIX/bin/telegrobsidian
  4. Expose the webhook over HTTPS and register it (Telegram needs TLS):
-      sudo scripts/register-telegram-webhook.sh --env-file $ENV_FILE
+      sudo $REPO_DIR/scripts/register-telegram-webhook.sh --env-file $ENV_FILE
 EOF
